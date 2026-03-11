@@ -23,7 +23,7 @@ from steptronoss.exp.abstract import ModelConfig as AbstractModelConfig
 from steptronoss.exp.abstract import ParallelConfig as AbstractParallelConfig
 from steptronoss.exp.abstract import TokenizerConfig as AbstractTokenizerConfig
 from steptronoss.exp.abstract import TrainerConfig as AbstractTrainerConfig
-from steptronoss.exp.optimizer import AdamConfig, OptimizerConfig
+from steptronoss.exp.optimizer import AdamConfig, MOGAConfig, OptimizerConfig
 from steptronoss.exp.resources import ResourceConfig
 
 if TYPE_CHECKING:

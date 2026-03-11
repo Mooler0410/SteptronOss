@@ -193,3 +193,136 @@ class MuonConfig(OptimizerConfig):
             run_ns_in_fp16=self.muon_run_ns_in_fp16,
             newtonschulz_fn=self.muon_newtonschulz_fn,
         )
+
+
+class MOGAConfig(OptimizerConfig):
+    """MOGA (Matrix Operator Geometry Aware) optimizer config.
+
+    Uses mean-normalized operator norm geometries for width-invariant optimization.
+    Row normalization under (p,mean)->infinity geometry is recommended (O(1) smoothness).
+    """
+
+    lr: float = Ref("...scheduler_cfg.lr")
+    """Base learning rate."""
+    weight_decay: float = Ref("...scheduler_cfg.weight_decay")
+    """Global weight decay."""
+    weight_decay_on_1d_params: bool = False
+
+    # MOGA-specific parameters
+    moga_norm_type: str = "row"
+    """Normalization type: 'row' for (p,mean)->infinity, 'col' for 1->(q,mean)."""
+    moga_p: float = 2.0
+    """p parameter for row normalization. p=1 recovers SignSGD, p=2 recommended."""
+    moga_q: float = 2.0
+    """q parameter for column normalization. q>=2 for width-invariant smoothness."""
+    moga_momentum: float = 0.95
+    """MOGA momentum coefficient."""
+    moga_nesterov: bool = True
+    """Enable Nesterov-style update."""
+
+    # AdamW fallback for 1D params
+    adam_eps: float = 1e-8
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
+
+    # Parameter selection (same pattern as Muon)
+    moga_param_attr_only: bool = False
+    """Only use params already tagged with is_moga_param."""
+    moga_exclude_embeddings: bool = True
+    """Exclude embedding weights from MOGA."""
+    moga_exclude_names: tuple[str, ...] = ()
+    """Exclude params whose names contain any of these substrings."""
+
+    def mark_moga_params(self, model: Module) -> NoReturn:
+        """Set param.is_moga_param for all parameters using internal exclude rules."""
+        moga_exclude_names = self.moga_exclude_names
+        if moga_exclude_names is None:
+            moga_exclude_names = ()
+
+        embedding_params: set[Parameter] = set()
+        if self.moga_exclude_embeddings:
+            for module in model.modules():
+                if isinstance(module, torch.nn.Embedding) or "Embedding" in module.__class__.__name__:
+                    weight = getattr(module, "weight", None)
+                    if isinstance(weight, Parameter):
+                        embedding_params.add(weight)
+
+        for name, param in model.named_parameters():
+            if getattr(param, "is_moga_param", False):
+                is_moga_param = True
+            elif (
+                self.moga_param_attr_only
+                or (self.moga_exclude_embeddings and param in embedding_params)
+                or (moga_exclude_names and any(tag in name for tag in moga_exclude_names))
+            ):
+                is_moga_param = False
+            else:
+                is_moga_param = param.ndim == 2
+
+            param.is_moga_param = is_moga_param
+
+    def mark_gather_ops(self, model: Module) -> NoReturn:
+        """Attach merge_op for each parameter based on its TP partition info."""
+        from steptronoss.checkpointing.reshape_ops import ColumnParallel, Inverse, KeepThisTP, RowParallel, Sequential
+
+        identity = Sequential([])
+
+        for _, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            if getattr(param, "tensor_model_parallel", False):
+                partition_dim = getattr(param, "partition_dim", -1)
+                if partition_dim == 0:
+                    merge_op = Inverse(ColumnParallel() + KeepThisTP())
+                elif partition_dim == 1:
+                    merge_op = Inverse(RowParallel() + KeepThisTP())
+                else:
+                    merge_op = identity
+            else:
+                merge_op = identity
+
+            param.merge_op = merge_op
+
+    def build_optimizer(self, model: Module) -> torch.optim.Optimizer:
+        from steptronoss.optimizer.moga import MOGA
+        from steptronoss.optimizer.utils import advanced_get_param_groups
+
+        self.mark_moga_params(model)
+        self.mark_gather_ops(model)
+        missing_merge_op = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if not hasattr(param, "merge_op"):
+                missing_merge_op.append(name)
+        if missing_merge_op:
+            preview = ", ".join(missing_merge_op[:10])
+            total = len(missing_merge_op)
+            raise RuntimeError(
+                "MOGA requires merge_op for all trainable params, "
+                f"but found {total} missing (showing first 10): {preview}"
+            )
+
+        def is_moga_param(name: str, param: Parameter) -> bool:
+            return getattr(param, "is_moga_param", False)
+
+        param_groups = advanced_get_param_groups(
+            model,
+            scale_lr_cond=self.scale_lr_func,
+            scale_wd_cond=self.scale_wd_cond,
+            is_moga_param=is_moga_param,
+        )
+
+        return MOGA(
+            param_groups,
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+            norm_type=self.moga_norm_type,
+            p=self.moga_p,
+            q=self.moga_q,
+            momentum=self.moga_momentum,
+            nesterov=self.moga_nesterov,
+            adamw_betas=(self.adam_beta1, self.adam_beta2),
+            adamw_eps=self.adam_eps,
+        )
