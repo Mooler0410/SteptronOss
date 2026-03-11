@@ -5,7 +5,10 @@ import math
 import torch
 from loguru import logger
 
-from steptronoss.checkpointing.reshape_ops import Identity, ReshapeOp
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from steptronoss.checkpointing.reshape_ops import ReshapeOp
 
 
 def moga_row_normalize(G: torch.Tensor, p: float = 2.0) -> torch.Tensor:
@@ -168,8 +171,10 @@ class MOGA(torch.optim.Optimizer):
             q = group["q"]
 
             for param in group["params"]:
-                merge_op: ReshapeOp = getattr(param, "merge_op", None)
+                merge_op = getattr(param, "merge_op", None)
                 if merge_op is None:
+                    from steptronoss.checkpointing.reshape_ops import Identity
+
                     logger.warning(
                         f"A param with shape {param.shape} has no merge_op, using identity."
                     )
